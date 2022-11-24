@@ -27,7 +27,7 @@ ldRR                 = const(1)     # Rear Right LED
 
 
 WiFi_AP_Password     = "2knedLici"
-WiFi_AP_Channel      = 8
+WiFi_AP_Channel      = 2
 WiFi_AP_IP           = "192.168.50.254"
 WiFi_AP_SM           = "255.255.255.0"
 WiFi_AP_DHCP_From    = "192.168.50.200"
@@ -38,8 +38,8 @@ ESP_Networks = (
                 Password="10knedLiku"
                 ),
         
-        Network(SSID="HOME_SSID",
-                Password="HOME_PWD",
+        Network(SSID="Pidisvet",
+                Password="12knedLiku",
                 #IP="192.168.2.10",
                 #SM="255.255.255.0",
                 #DG="192.168.2.254"

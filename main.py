@@ -12,6 +12,9 @@ from Buttons import *
 import gc
 import utime
 import sys, os
+import framebuf
+from Screens import *
+import _thread
 
 ####################################################################################################
 # CONSTANTS                                                                                        #
@@ -40,12 +43,16 @@ ButtonState = [ False, False, False ]   # Buttons actual state ( EXE, UP, DOWN)
 ButtonLState = ButtonState
 
 DisplayedScreen = None
-RequuestedScreen = None
+RequestedScreen = None
+LastScreenUpdate = None
 
 btnCode = 0
 
+SecondCoreLock = _thread.allocate_lock();
+IIC_Lock = _thread.allocate_lock();
+
+freq(100000000)
 print("============== INITIALIZING ==============")
-print(freq())
 print("--> initializing pins             ... ",end = "")
 ####################################################################################################
 # PIN DEFINITIONS                                                                                  #
@@ -76,7 +83,7 @@ M1_IN2    = Pin(21, Pin.OUT, value=0)   # M1 direction control 2
 M1_PWM    = Pin(22)                     # M1 speed control pin
 PWR_EXT   = Pin(24)                     # External (USB) powered
 
-PWR_BTN.irq(trigger = Pin.IRQ_RISING | Pin.IRQ_FALLING, handler = btnPwrCallback)
+#PWR_BTN.irq(trigger = Pin.IRQ_RISING | Pin.IRQ_FALLING, handler = btnPwrCallback)
 print("done")
 ####################################################################################################
 # ADC DEFINITIONS                                                                                  #
@@ -89,31 +96,7 @@ TEMP_ADC  = ADC(4)                       # On-board temperature sensor
 LED_PWM = PWM(I_LED)
 LED_PWM.freq(2000)
 
-####################################################################################################
-# CHECK START REASON                                                                               #
-####################################################################################################
-if PWR_EXT.value() == 1 and PWR_BTN.value() == 1:
-    # charging
-    print()
-    print("--> battery charging mode         ... ",end = "")
-    LED_PWM_duty = 0
-    LED_PWM.duty_u16(LED_PWM_duty)
-    LED_PWM_inc = True
-    while PWR_BTN.value() == 1:
-        if LED_PWM_inc:
-            LED_PWM_duty += 1000
-        else:
-            LED_PWM_duty -= 1000
-        if LED_PWM_duty >= 64000:
-            LED_PWM_inc = False
-        if LED_PWM_duty <= 3000:
-            LED_PWM_inc = True
-        LED_PWM.duty_u16(LED_PWM_duty)
-        utime.sleep(0.03)
-    print("exit")
-    print()
 
-PWR_ON.on()
 
 ####################################################################################################
 # BLINK TIMER INITIALIZATION                                                                       #
@@ -122,17 +105,19 @@ CLK_1Hz = False
 CLK_CNT = 0
 def CLK_10Hz_Tick(timer):
     global CLK_1Hz, CLK_CNT, LED_PWM
-    #gc.collect()
+    gc.collect()
     CLK_CNT += 1
     if CLK_CNT == 5:
         CLK_1Hz = True
     if CLK_CNT == 10:
         CLK_1Hz = False
         CLK_CNT = 0
-    if CLK_CNT == 0 or CLK_CNT == 3:
-        LED_PWM.duty_u16(65052)
-    if CLK_CNT == 1 or CLK_CNT == 4:
-        LED_PWM.duty_u16(0)
+        #gc.collect()
+    if PWR_ON.value() == 1:
+        if CLK_CNT == 0 or CLK_CNT == 3 :
+            LED_PWM.duty_u16(65052)
+        if CLK_CNT == 1 or CLK_CNT == 4:
+            LED_PWM.duty_u16(0)
         
 CLK_1Hz_Timer = Timer(period=100, mode=Timer.PERIODIC, callback=CLK_10Hz_Tick)
 
@@ -141,7 +126,7 @@ CLK_1Hz_Timer = Timer(period=100, mode=Timer.PERIODIC, callback=CLK_10Hz_Tick)
 # BUSES INITIALIZATION                                                                             #
 ####################################################################################################
 print("--> initializing internal I2C     ... ",end = "")
-int_i2c = I2C(1, scl=I2C_SCL, sda=I2C_SDA, freq=400000)
+int_i2c = I2C(1, scl=I2C_SCL, sda=I2C_SDA, freq=500000)
 print("done")
 print("      - {}".format(int_i2c))
 print("      - I2C scanning              ... ",end = "")
@@ -155,11 +140,12 @@ print(int_i2c_dev)
 ####################################################################################################
 print("--> initializing display          ... ",end = "")
 disp = None
+fnt = Font.Font5x7()
 if 0x3C in int_i2c_dev:
     disp = SH1106_I2C(128, 64, int_i2c, rotate=180)      # oled controller
     disp.fill(0)
     disp.contrast(30)
-    Font.PrintString(disp, SystemName, int((128 - (len(SystemName) * 12)) / 2), 0, 2, 1)
+    fnt.PrintString(disp, SystemName, int((128 - (len(SystemName) * 12)) / 2), 0, 2, 1)
     disp.hline(0,18,128, 1)
     disp.show()
     print("done")
@@ -167,7 +153,123 @@ else:
     print("fail")
     print("    !!! NOT FOUND ON BUS !!!")
 
-    
+def DisplayUpdateThread():
+    SecondCoreLock.acquire()
+    global disp, fnt, DisplayedScreen, RequestedScreen
+    StrtTick = utime.ticks_us()
+    """  """
+    #print("Display refresh ...", end = " ")
+    if RequestedScreen != None: 
+        if DisplayedScreen != RequestedScreen:
+            disp.fill(0)
+            if RequestedScreen == 1:
+                PaintScreen_1(disp, fnt)
+                UpdateScreen_1(disp, fnt, BatteryVoltage, DCDCVoltage, Temperature, ScanAverage / 1000)
+            DisplayedScreen = RequestedScreen
+            IIC_Lock.acquire()
+            disp.show()
+            IIC_Lock.release()
+        elif DisplayedScreen == RequestedScreen:
+            if DisplayedScreen == 1:
+                UpdateScreen_1(disp, fnt, BatteryVoltage, DCDCVoltage, Temperature, ScanAverage / 1000)
+            IIC_Lock.acquire()
+            disp.show()
+            IIC_Lock.release()
+    #print("done in {0:d} us".format(utime.ticks_diff(utime.ticks_us(), StrtTick)))
+    SecondCoreLock.release()
+
+
+####################################################################################################
+# CHECK START REASON                                                                               #
+####################################################################################################
+if PWR_EXT.value() == 1 and PWR_BTN.value() == 1:
+    # charging
+    print()
+    print("--> battery charging mode         ... ",end = "")
+    LED_PWM_duty = 0
+    LED_PWM.duty_u16(LED_PWM_duty)
+    LED_PWM_inc = True
+    if disp != None:
+        with open('/Icons/sleep.pbm', 'rb') as f:
+            f.readline() # Magic number
+            f.readline() # Creator comment
+            f.readline() # Dimensions
+            data = bytearray(f.read())
+            fbuf = framebuf.FrameBuffer(data, 59, 40, framebuf.MONO_HLSB)
+        disp.blit(fbuf, 2, 22)
+        with open('/Icons/BattCh0.pbm', 'rb') as f:
+            f.readline() # Magic number
+            f.readline() # Creator comment
+            f.readline() # Dimensions
+            data = bytearray(f.read())
+            fbufB0 = framebuf.FrameBuffer(data, 24, 24, framebuf.MONO_HLSB)
+        disp.blit(fbuf, 2, 22)
+        disp.blit(fbufB0, 85, 22)
+        fnt.PrintString(disp, "0.00", 70, 50, 2, 1)
+        fnt.PrintString(disp, "V", 121, 50, 1, 1)
+        disp.show()
+        
+        with open('/Icons/BattCh33.pbm', 'rb') as f:
+            f.readline() # Magic number
+            f.readline() # Creator comment
+            f.readline() # Dimensions
+            data = bytearray(f.read())
+            fbufB33 = framebuf.FrameBuffer(data, 24, 24, framebuf.MONO_HLSB)
+        with open('/Icons/BattCh66.pbm', 'rb') as f:
+            f.readline() # Magic number
+            f.readline() # Creator comment
+            f.readline() # Dimensions
+            data = bytearray(f.read())
+            fbufB66 = framebuf.FrameBuffer(data, 24, 24, framebuf.MONO_HLSB)
+        with open('/Icons/BattCh100.pbm', 'rb') as f:
+            f.readline() # Magic number
+            f.readline() # Creator comment
+            f.readline() # Dimensions
+            data = bytearray(f.read())
+            fbufB100 = framebuf.FrameBuffer(data, 24, 24, framebuf.MONO_HLSB)
+        
+    BICnt = 0
+    BILCTS = utime.ticks_ms()
+    while PWR_BTN.value() == 1:
+        if LED_PWM_inc:
+            LED_PWM_duty += 1000
+        else:
+            LED_PWM_duty -= 1000
+        if LED_PWM_duty >= 64000:
+            LED_PWM_inc = False
+        if LED_PWM_duty <= 3000:
+            LED_PWM_inc = True
+        LED_PWM.duty_u16(LED_PWM_duty)
+        if utime.ticks_diff(utime.ticks_ms(), BILCTS) > 400:
+            BICnt += 1
+            if BICnt == 4:
+                BICnt = 0
+            disp.fill_rect(70, 22, 50, 42, 0)
+            if BICnt == 0:
+                disp.blit(fbufB0, 85, 22)
+            elif BICnt == 1:
+                disp.blit(fbufB33, 85, 22)
+            elif BICnt == 2:
+                disp.blit(fbufB66, 85, 22)
+            elif BICnt == 3:
+                disp.blit(fbufB100, 85, 22)
+            BatteryVoltage = VBAT_ADC.read_u16() * ADC_LSB * 2 * VBAT_CAL
+            fnt.PrintString(disp, "{:0.2f}".format(BatteryVoltage), 70, 50, 2, 1)
+            disp.show()
+            BILCTS = utime.ticks_ms()
+        utime.sleep(0.03)
+    print("exit")
+    freq(200000000)
+    fbufB0 = None
+    fbufB33 = None
+    fbuf66 = None
+    fbuf100 = None 
+    print()
+    disp.fill_rect(0, 22, 128, 44, 0)
+
+gc.enable()
+PWR_ON.on()
+gc.threshold(6000)    
 ####################################################################################################
 # NEOPIXEL LED INITIALIZATION                                                                      #
 ####################################################################################################
@@ -224,20 +326,40 @@ if ServoDrv != None:
 esp = None
 if disp != None and DisplayedScreen == None:
     #disp.text("WIFI INITIALIZING", 0, 20, 1)
-    Font.PrintString(disp, "WIFI INITIALIZATION", 8, 26, 1, 1)
-    Font.PrintString(disp, "SETTING ESP", 30, 45, 1, 1)
+    fnt.PrintString(disp, "[    ]", 0, 22, 1, 1)
+    fnt.PrintString(disp, "SETTING WIFI", 40, 22, 1, 1)
+    fnt.PrintString(disp, "CHECKING AP", 40, 32, 1, 1)
+    fnt.PrintString(disp, "STA CONNECT", 40, 42, 1, 1)
+    fnt.PrintString(disp, "AP ACTIVATE", 40, 52, 1, 1)
     disp.show()
 ### CALLBACKS ######################################################################################
   # State change callback
 def WiFi_StateChange(Connection, NewState):
-    global esp, ReadyForConnect, Disconnected_ts
-    gc.collect()
+    global esp, ReadyForConnect, Disconnected_ts, RequestedScreen, LastScreenUpdate
     if esp != None:
         if Connection == None:
             if NewState == esp.ESP_Initialized:
                 if disp != None and DisplayedScreen == None:
-                    disp.fill_rect(0, 44, 127, 16, 0)
-                    Font.PrintString(disp, "ACTIVATING AP", 24, 45, 1, 1)
+                    fnt.PrintString(disp, "[ OK ]", 0, 22, 1, 1)
+                    fnt.PrintString(disp, "[    ]", 0, 32, 1, 1)
+                    disp.show()
+                esp.STA_Connect()
+            elif NewState == esp.ESP_STA_Connecting:
+                if disp != None and DisplayedScreen == None:
+                    fnt.PrintString(disp, "[ OK ]", 0, 32, 1, 1)
+                    fnt.PrintString(disp, "[    ]", 0, 42, 1, 1)
+                    disp.show()
+            elif NewState == esp.ESP_STA_ConnectingDone:
+                if disp != None and DisplayedScreen == None:
+                    fnt.PrintString(disp, "[ OK ]", 0, 42, 1, 1)
+                    fnt.PrintString(disp, "[    ]", 0, 52, 1, 1)
+                    disp.show()
+                esp.StartServer(SystemPort)
+            elif NewState == esp.ESP_STA_KnownNetworkNotFound:
+                if disp != None and DisplayedScreen == None:
+                    fnt.PrintString(disp, "[-NF-]", 0, 32, 1, 1)
+                    fnt.PrintString(disp, "[SKIP]", 0, 42, 1, 1)
+                    fnt.PrintString(disp, "[    ]", 0, 42, 1, 1)
                     disp.show()
                 esp.AP_Activate(SSID = SystemName,
                                 Password = WiFi_AP_Password,
@@ -247,29 +369,22 @@ def WiFi_StateChange(Connection, NewState):
                                 DHCP_From = WiFi_AP_DHCP_From,
                                 DHCP_To = WiFi_AP_DHCP_To)
             elif NewState == esp.ESP_AP_Activated:
-                esp.STA_Connect()
-            elif NewState == esp.ESP_NetworkScanning:
                 if disp != None and DisplayedScreen == None:
-                    disp.fill_rect(0, 44, 127, 16, 0)
-                    Font.PrintString(disp, "NETWORK SCANNING", 15, 45, 1, 1)
-                    disp.show()
-            elif NewState == esp.ESP_STA_Connecting:
-                if disp != None and DisplayedScreen == None:
-                    disp.fill_rect(0, 44, 127, 16, 0)
-                    Font.PrintString(disp, "STA CONNECTING", 20, 45, 1, 1)
-                    disp.show()
-            elif NewState == esp.ESP_STA_ConnectingDone:
+                    pass
                 esp.StartServer(SystemPort)
             elif NewState == esp.ESP_ServerStarted:
-                esp.Debug(False)
+                #esp.Debug(False)
                 ReadyForConnect = True
                 if disp != None and DisplayedScreen == None:
-                    disp.fill_rect(0, 26, 127, 38, 0)
-                    Font.PrintString(disp, "WIFI READY", 32, 26, 1, 1)
-                    Font.PrintString(disp, "WAIT FOR CONNECTION", 5, 45, 1, 1)
-                    Font.PrintString(disp, esp.STA_NetInfo[0], 20, 55, 1, 1)
+                    if esp.STA_State.SSID == None:
+                        fnt.PrintString(disp, "[ OK ]", 0, 52, 1, 1)
+                    else:
+                        fnt.PrintString(disp, "[ OK ]", 0, 52, 1, 1)
                     disp.show()
-                NeoSequencer.StartSequence( 1, False )
+                NeoSequencer.StartSequence( 2, False )
+                RequestedScreen = 1
+                LastScreenUpdate = utime.ticks_ms()
+                print("------")
         elif Connection == 0:
             if NewState == esp.ESP_Connected:
                 ReadyForConnect = False
@@ -277,6 +392,7 @@ def WiFi_StateChange(Connection, NewState):
                 NeoSequencer.StartSequence( 2, False )
             elif NewState == esp.ESP_Disconnected:
                 Disconnected_ts = utime.ticks_ms()
+                NeoSequencer.StartSequence( 1, False )
 
                 
   # Data Received callback
@@ -299,33 +415,31 @@ esp.ON()
 
 
 
-"""PWM_1 = PWM(M1_PWM)
-PWM_1.freq(25000)
-PWM_1.duty_u16(45000)
-M1_IN1.off()
-M1_IN2.on()
+PWM_1 = PWM(M1_PWM)
+PWM_1.freq(800)
+PWM_1.duty_u16(40000)
+M1_IN1.on()
+M1_IN2.off()
 
 PWM_2 = PWM(M2_PWM)
-PWM_2.freq(25000)
-PWM_2.duty_u16(45000)
+PWM_2.freq(800)
+PWM_2.duty_u16(40000)
 M2_IN1.on()
 M2_IN2.off()
 
 PWM_3 = PWM(M3_PWM)
-PWM_3.freq(25000)
-PWM_3.duty_u16(45000)
-M3_IN1.off()
-M3_IN2.on()
+PWM_3.freq(800)
+PWM_3.duty_u16(40000)
+M3_IN1.on()
+M3_IN2.off()
 
 PWM_4 = PWM(M4_PWM)
-PWM_4.freq(25000)
-PWM_4.duty_u16(45000)
+PWM_4.freq(800)
+PWM_4.duty_u16(40000)
 M4_IN1.off()
 M4_IN2.on()
 
-M_STBY.on()"""
-
-
+#M_STBY.on()
 
 
 ####################################################################################################
@@ -333,44 +447,51 @@ M_STBY.on()"""
 ####################################################################################################
 try:
     InitializedTS = utime.ticks_us()
-    LastDispUpdate = utime.ticks_ms()
-    #PanServo.degMove(130, 130)
+    LastScreenUpdate = utime.ticks_ms()
+    PanServo.degMove(130, 130)
     TiltServo.degMove(-20, 5)
     while True:
         ##### CHECK BUTTONS PRESS ###########################################################
-        btnCode = ButtonsPeriodic(BTN_ADC)
+        btnCode = ButtonsPeriodic(PWR_BTN, BTN_ADC)
+        if btnCode != '':
+            print(btnCode)
         if btnCode == 'Q':
+            while SecondCoreLock.locked():
+                utime.sleep_ms(1)
             break
+        
         ##### Battery voltage and temperature reading #######################################
         BatteryVoltage = VBAT_ADC.read_u16() * ADC_LSB * 2 * VBAT_CAL
         DCDCVoltage = V5_ADC.read_u16() * ADC_LSB * 2 * VDC_CAL
         Temperature = 27 - ((TEMP_ADC.read_u16() * ADC_LSB) - 0.706)/0.001721
-        """if disp != None and (utime.ticks_ms() - LastDispUpdate) > 2000:
-            disp.fill_rect(0, 26, 127, 38, 0)
-            Font.PrintString(disp, "{0:0.3f}".format(BatteryVoltage), 5, 36, 1, 1)
-            Font.PrintString(disp, "{0:0.1f}".format(Temperature), 5, 45, 1, 1)
-            Font.PrintString(disp, "{0:0.1f}".format(DCDCVoltage), 5, 54, 1, 1)
-            disp.show()
-            LastDispUpdate = utime.ticks_ms()"""
         
         
         ##### Periodical class update #######################################################
         NeoSequencer.Periodic()
-        for srv in Servos:
-            srv.periodic()
-        
-        
-        """if PanServo.inPosition:
+        """if not IIC_Lock.locked():
+            for srv in Servos:
+                srv.periodic()       
+        if PanServo.inPosition:
             if PanServo.actualPosition > 0:
                 PanServo.degMove(-130, 110)
             else:
                 PanServo.degMove(130, 110)"""
                 
-        if TiltServo.inPosition:
+        """if TiltServo.inPosition:
             if TiltServo.actualPosition > 0:
-                TiltServo.degMove(80, 5)
-            else:
-                TiltServo.degMove(-20, 5)
+                TiltServo.degMove(80, 5)                 
+            else:        
+                TiltServo.degMove(-20, 5)"""
+        
+        ##### Screen updates ################################################################
+        FromLastUpdate = utime.ticks_diff(utime.ticks_ms(), LastScreenUpdate)
+        #if not SecondCoreLock.locked() and disp != None and RequestedScreen != None and FromLastUpdate > 500:
+        if not SecondCoreLock.locked() :
+            LastScreenUpdate = utime.ticks_ms()
+            _thread.start_new_thread(DisplayUpdateThread, ())
+
+                    
+                
         
         ##### Scan duration statistics counting #############################################
         if ScanStartTS == None:
@@ -380,13 +501,14 @@ try:
         else:
             ScanNumber += 1
             ScanActual = utime.ticks_diff(utime.ticks_us(), ScanStartTS)
-            AvgD = (ScanAverage - ScanActual) / ScanNumber
-            ScanActual += AvgD
-        ScanStartTS = utime.ticks_us()        
-        if ScanMaximal == None or ScanMaximal < ScanActual:
+            AvgD = (ScanActual - ScanAverage) / ScanNumber
+            ScanAverage = ScanAverage + AvgD
+        ScanStartTS = utime.ticks_us()
+        """if ScanMaximal == None or ScanMaximal < ScanActual:
             ScanMaximal = ScanActual
         if ScanMinimal == None or ScanMinimal > ScanActual:
-            ScanMinimal = ScanActual
+            ScanMinimal = ScanActual"""
+        #utime.sleep(0.001)
         
         
 
@@ -394,6 +516,8 @@ try:
 except KeyboardInterrupt:
     print("==========================================")
     print("=====         Breaked by user        =====")
+    while SecondCoreLock.locked():
+        utime.sleep_ms(1)
 except Exception as e:
     print("==========================================")
     print()
@@ -407,9 +531,9 @@ else:
 print("===== init : {0: >15.1f} ms".format((InitializedTS - StartTime)/1000))
 print("===== run  : {0: >15.1f} min".format((utime.ticks_us() - StartTime) / 60000000))
 print("===== SCAN TIME STATISTICS:")
-print("=====  max : {0: >15.2f} ms".format(ScanMaximal/1000))
+#print("=====  max : {0: >15.2f} ms".format(ScanMaximal/1000))
 print("=====  avg : {0: >15.2f} ms".format(ScanAverage/1000))
-print("=====  min : {0: >15.2f} ms".format(ScanMinimal/1000))
+#print("=====  min : {0: >15.2f} ms".format(ScanMinimal/1000))
 print("=====  num : {0: >15d}".format(ScanNumber))
 print("===== GOOD BYE")
 

@@ -65,8 +65,8 @@ LED_sequencies = (
             Duration = 50),
         LED_sequencer_step (
             LED_Colors = (
-                ( ldRL, 30, 30, 30 ),
-                ( ldRR, 30, 30, 30 ),
+                ( ldRL, 20, 20, 20 ),
+                ( ldRR, 20, 20, 20 ),
                 ( ldBFR, 255, 255, 255 ),
                 ( ldBFL, 255, 255, 255 ),
                 ( ldBRR, 255, 255, 255 ),

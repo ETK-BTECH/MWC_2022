@@ -25,7 +25,7 @@ class LED_sequencer:
             return len(self.__Sequences)
     
     def StartSequence(self, Sequence, Immediatelly):
-        if Immediatelly or self.__Sequences[self.__CurrentSequence].Duration == 0:
+        if Immediatelly or self.__CurrentSequenceStepData.Duration == 0:
             self.__CurrentSequenceStepID = 0
             self.__CurrentSequence = Sequence
             self.__RequestedSequence = None
@@ -33,7 +33,8 @@ class LED_sequencer:
             self.__LoadStep()
             self.__UpdateLED()
         else:
-            self.__RequstedSequence = Sequence
+            self.__RequestedSequence = Sequence
+
     
     def Periodic(self):
         if not self.__CurrentSequenceStepData.IsExpired(self.__StepStartTime):
